@@ -228,13 +228,14 @@ Instructions:
 
 ### Must Have (MVP)
 - [ ] Text extraction from PDF/TXT
-- [ ] Basic chunking with Chonkie
+- [ ] Basic chunking with Chonkie (recipe-aware for cookbook)
 - [ ] Supabase vector table setup
 - [ ] Embedding generation
-- [ ] Vector similarity search
-- [ ] LLM response generation
+- [ ] Vector similarity search with **threshold filtering (>0.7)**
+- [ ] LLM response generation with **grounded anti-hallucination prompt**
 - [ ] Simple CLI or web interface
 - [ ] Open original PDF to source page with highlighted text
+- [ ] **"Not found" fallback** when no good matches exist
 
 ### Should Have
 - [ ] Chapter/recipe metadata extraction
@@ -338,6 +339,210 @@ def highlight_and_open(pdf_path, page_num, search_text):
 
 ---
 
+## 🚨 Critical Accuracy Improvements (20-30 min build)
+
+### 1. Anti-Hallucination Guardrails
+
+**Grounded Response Enforcement:**
+```python
+SYSTEM_PROMPT = """
+You are a book assistant. You MUST follow these rules:
+
+1. ONLY use information from the PROVIDED PASSAGES below
+2. If the answer is NOT in the passages, say "I couldn't find this in the book"
+3. ALWAYS cite the exact page number and chapter for every claim
+4. NEVER invent quotes, scenes, or details not in the passages
+5. If uncertain, say "Based on the passages, it appears..." rather than stating as fact
+
+PASSAGES:
+{retrieved_chunks}
+
+Each passage is tagged with [Page X, Chapter Y]. Use these citations.
+"""
+```
+
+**Validation Layer (Post-LLM Check):**
+```python
+def validate_response(llm_response, retrieved_chunks):
+    """Check if LLM claims are grounded in source material"""
+    # Extract any quotes from response
+    quotes = extract_quotes(llm_response)
+    
+    # Verify each quote exists in chunks
+    all_chunks_text = " ".join([c["content"] for c in retrieved_chunks])
+    for quote in quotes:
+        if quote.lower() not in all_chunks_text.lower():
+            return flag_as_potentially_hallucinated(quote)
+    
+    return llm_response
+```
+
+**Confidence Scoring:**
+```python
+# Return similarity scores with results
+results = supabase.rpc('match_documents', {
+    'query_embedding': embedding,
+    'match_threshold': 0.7,  # REJECT chunks below this
+    'match_count': 5
+}).execute()
+
+# If best match is below 0.75, warn user
+if results[0]['similarity'] < 0.75:
+    prepend_warning = "⚠️ Low confidence match. Results may not be exact."
+```
+
+### 2. Chunking Accuracy (Chonkie Settings)
+
+**For Novels - Preserve Scene Context:**
+```python
+from chonkie import SemanticChunker
+
+novel_chunker = SemanticChunker(
+    chunk_size=1024,           # Larger chunks = more context
+    chunk_overlap=200,         # Overlap catches split sentences
+    similarity_threshold=0.6,  # Keep semantically related content together
+)
+```
+
+**For Cookbooks - Recipe-Aware Chunking:**
+```python
+# DON'T split recipes - use regex to find boundaries first
+import re
+
+def extract_recipes(text):
+    # Split on recipe headers, keep each recipe as ONE chunk
+    recipe_pattern = r'(?=\n[A-Z][A-Za-z\s]+\n(?:Serves|Prep|Ingredients))'
+    recipes = re.split(recipe_pattern, text)
+    return [r.strip() for r in recipes if len(r) > 100]
+```
+
+**Key Settings:**
+| Parameter | Novel | Cookbook |
+|-----------|-------|----------|
+| chunk_size | 1024 | 2048 (full recipe) |
+| overlap | 200 | 50 |
+| split_on | paragraphs | recipe boundaries |
+
+### 3. Embedding Accuracy Boost
+
+**Query Expansion (Huge Accuracy Gain):**
+```python
+def expand_query(user_query, llm):
+    """Generate multiple search queries for better recall"""
+    prompt = f"""
+    User question: "{user_query}"
+    
+    Generate 3 alternative search queries that would find relevant passages:
+    1. Rephrase the question
+    2. Use synonyms or related terms  
+    3. Be more specific
+    
+    Return as JSON array.
+    """
+    alternatives = llm.generate(prompt)
+    return [user_query] + alternatives  # Search with all 4
+
+# Then search with each and merge results
+all_results = []
+for query in expand_query(user_query, llm):
+    results = vector_search(query)
+    all_results.extend(results)
+
+# Dedupe and re-rank
+final_results = dedupe_and_rerank(all_results)
+```
+
+**Example Expansion:**
+- User: "encounters with Dumbledore"
+- Expanded: ["encounters with Dumbledore", "Dumbledore speaking to", "Dumbledore appeared", "conversation with Albus"]
+
+### 4. Retrieval Accuracy
+
+**Hybrid Search (Vector + Keyword):**
+```sql
+-- Supabase function combining vector similarity + text match
+CREATE OR REPLACE FUNCTION hybrid_search(
+    query_embedding vector(384),
+    query_text text,
+    match_count int
+)
+RETURNS TABLE (id uuid, content text, similarity float, keyword_rank float)
+AS $$
+    SELECT 
+        id,
+        content,
+        1 - (embedding <=> query_embedding) as similarity,
+        ts_rank(to_tsvector('english', content), plainto_tsquery('english', query_text)) as keyword_rank
+    FROM document_chunks
+    WHERE to_tsvector('english', content) @@ plainto_tsquery('english', query_text)
+       OR 1 - (embedding <=> query_embedding) > 0.7
+    ORDER BY (similarity * 0.7 + keyword_rank * 0.3) DESC
+    LIMIT match_count;
+$$ LANGUAGE sql;
+```
+
+**Metadata Filtering (Critical for Cookbooks):**
+```python
+# For "find me soup recipes" - filter FIRST, then vector search
+def search_with_filters(query, filters=None):
+    base_query = supabase.table('document_chunks').select('*')
+    
+    if filters:
+        # e.g., filters = {"metadata->category": "soup"}
+        for key, value in filters.items():
+            base_query = base_query.eq(key, value)
+    
+    # Then apply vector similarity on filtered set
+    return base_query.order('embedding <-> query_embedding').limit(5)
+```
+
+### 5. Quick Wins (Implement These First)
+
+**A. Minimum Similarity Threshold:**
+```python
+SIMILARITY_THRESHOLD = 0.72  # Reject anything below this
+results = [r for r in results if r['similarity'] > SIMILARITY_THRESHOLD]
+```
+
+**B. Force Citations in Output:**
+```python
+# Add to prompt
+"Format your response as:
+[Answer text] (Page X, Chapter Y)
+
+If you cannot cite a specific page, do not include that information."
+```
+
+**C. "Not Found" Fallback:**
+```python
+if len(results) == 0 or results[0]['similarity'] < 0.65:
+    return "I couldn't find information about this in the book. Try rephrasing your question."
+```
+
+**D. Chunk Deduplication:**
+```python
+# Avoid returning overlapping chunks
+def dedupe_chunks(chunks):
+    seen_pages = set()
+    unique = []
+    for chunk in chunks:
+        page_key = (chunk['page_number'], chunk['chapter'])
+        if page_key not in seen_pages:
+            unique.append(chunk)
+            seen_pages.add(page_key)
+    return unique
+```
+
+### 6. 20-Minute Priority Order
+
+1. **Set similarity threshold** (2 min) - Reject bad matches
+2. **Grounded system prompt** (3 min) - Anti-hallucination
+3. **Recipe-aware chunking** (5 min) - Don't split recipes
+4. **Metadata filters for cookbook** (5 min) - Filter by category
+5. **Query expansion** (5 min) - Multiple search terms
+
+---
+
 ## Success Criteria
 
 The demo succeeds if it can:
@@ -347,6 +552,12 @@ The demo succeeds if it can:
 2. ✅ Ingest a cookbook and answer: "Find me two soup recipes" returning actual recipe names and brief descriptions
 
 3. ✅ Handle follow-up questions about retrieved content
+
+4. ✅ **Refuse to answer** when information isn't in the book (no hallucination)
+
+5. ✅ **Cite exact page/chapter** for every claim made
+
+6. ✅ **Open original PDF** to the correct page with highlighted source text
 
 ---
 
